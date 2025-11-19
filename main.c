@@ -8,23 +8,28 @@
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
-#include "esp_hidd_api.h"
-#include "esp_bt_hid.h"
 #include "esp_gap_bt_api.h"
 #include "esp_log.h"
 #include "driver/uart.h"
-#include "soc/uart_reg.h"
+#include "esp_hid_gap.h"
+#include "esp_hidd.h"
 
 /* Настройки UART */
-#define UART_NUM UART_NUM_0        // Используем UART0 (GPIO1 - TX, GPIO3 - RX)
+#define UART_NUM UART_NUM_0
 #define BUF_SIZE (1024)
-#define RD_BYTES (2)               // Читаем 2 байта (dx и dy) за раз
+#define RD_BYTES (2)
 
 /* Настройки Bluetooth */
-#define HID_DEVICE_NAME "ESP32_HID_Mouse"  // Имя Bluetooth-устройства
+#define HID_DEVICE_NAME "ESP32_HID_Mouse"
+
+/* Глобальные переменные */
+static bool connected = false;
+static esp_bd_addr_t peer_addr;
+static esp_hidd_dev_t *hid_dev = NULL;
+static const char *TAG = "HID_Mouse";
 
 /* Дескриптор HID-мыши */
-static const uint8_t hid_mouse_report_descriptor[] = {
+static const uint8_t hid_mouse_report_map[] = {
     0x05, 0x01,        // Usage Page (Generic Desktop)
     0x09, 0x02,        // Usage (Mouse)
     0xA1, 0x01,        // Collection (Application)
@@ -53,17 +58,16 @@ static const uint8_t hid_mouse_report_descriptor[] = {
     0xC0               // End Collection
 };
 
+/* Конфигурация HID-устройства */
 static const esp_hidd_app_param_t app_param = {
     .name = "ESP32 Mouse",
     .description = "HID Mouse",
     .provider = "ESP32",
     .subclass = ESP_HID_CLASS_MIC,
-    .desc_list = hid_mouse_report_descriptor,
-    .desc_list_len = sizeof(hid_mouse_report_descriptor)
 };
 
 static const esp_hidd_qos_param_t both_qos = {
-    .service_type = 0x01,          // Best Effort
+    .service_type = 0x01,
     .token_rate = 0,
     .token_bucket_size = 0,
     .peak_bandwidth = 0,
@@ -71,52 +75,45 @@ static const esp_hidd_qos_param_t both_qos = {
     .delay_variation = 0
 };
 
-/* Глобальные переменные */
-static bool connected = false;
-static esp_bd_addr_t peer_addr;    // Адрес подключенного устройства
-static esp_hidd_dev_t *hid_dev = NULL;
-static const char *TAG = "HID_Mouse";
-
-/* Прототипы функций */
-static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
-static void gap_event_handler(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param);
-static void uart_init(void);
-static void hid_mouse_task(void *pvParameters);
-
 /* Обработчик событий HID */
-static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
+static void hidd_event_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
+    esp_hidd_event_t event = (esp_hidd_event_t)id;
+    esp_hidd_event_data_t *param = (esp_hidd_event_data_t *)event_data;
+
     switch (event) {
-    case ESP_HIDD_INIT_EVT:
-        ESP_LOGI(TAG, "HID профиль инициализирован");
-        // Регистрируем HID-приложение после инициализации
-        esp_bt_hid_device_register_app(&app_param, &both_qos, &both_qos);
-        break;
-    case ESP_HIDD_REGISTER_APP_EVT:
-        ESP_LOGI(TAG, "HID приложение зарегистрировано");
-        // Делаем устройство обнаруживаемым
-        esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
-        break;
-    case ESP_HIDD_OPEN_EVT:
-        if (param->open.status == ESP_HIDD_SUCCESS) {
+        case ESP_HIDD_START_EVENT:
+            ESP_LOGI(TAG, "HID начал работу");
+            break;
+            
+        case ESP_HIDD_CONNECT_EVENT:
             connected = true;
-            memcpy(peer_addr, param->open.remote_bda, ESP_BD_ADDR_LEN);
+            memcpy(peer_addr, param->connect.remote_bda, ESP_BD_ADDR_LEN);
             ESP_LOGI(TAG, "Подключено к: %02x:%02x:%02x:%02x:%02x:%02x",
                      peer_addr[0], peer_addr[1], peer_addr[2],
                      peer_addr[3], peer_addr[4], peer_addr[5]);
-        }
-        break;
-    case ESP_HIDD_CLOSE_EVT:
-        connected = false;
-        ESP_LOGI(TAG, "Отключено");
-        // Снова делаем обнаруживаемым для нового подключения
-        esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
-        break;
-    case ESP_HIDD_SEND_REPORT_EVT:
-        // Отчет отправлен
-        break;
-    default:
-        break;
+            break;
+            
+        case ESP_HIDD_PROTOCOL_MODE_EVENT:
+            ESP_LOGI(TAG, "Протокольный режим: %s", 
+                     param->protocol_mode.protocol_mode ? "BOOT" : "REPORT");
+            break;
+            
+        case ESP_HIDD_DISCONNECT_EVENT:
+            connected = false;
+            ESP_LOGI(TAG, "Отключено");
+            // Снова делаем обнаруживаемым для нового подключения
+            esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
+            break;
+            
+        case ESP_HIDD_SEND_REPORT_EVENT:
+            if (param->send_report.status == ESP_HIDD_REPORT_SEND_SUCCESS) {
+                ESP_LOGI(TAG, "Отчет отправлен успешно");
+            }
+            break;
+            
+        default:
+            break;
     }
 }
 
@@ -124,27 +121,34 @@ static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *
 static void gap_event_handler(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
     switch (event) {
-    case ESP_BT_GAP_AUTH_CMPL_EVT:
-        if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
-            ESP_LOGI(TAG, "Аутентификация успешна");
-        } else {
-            ESP_LOGE(TAG, "Ошибка аутентификации");
-        }
-        break;
-    case ESP_BT_GAP_PIN_REQ_EVT:
-        // Для устройств, требующих PIN-код (обычно не требуется для HID)
-        esp_bt_pin_code_t pin_code = {0};
-        esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin_code);
-        break;
-    default:
-        break;
+        case ESP_BT_GAP_AUTH_CMPL_EVT:
+            if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+                ESP_LOGI(TAG, "Аутентификация успешна");
+            } else {
+                ESP_LOGE(TAG, "Ошибка аутентификации: %d", param->auth_cmpl.stat);
+            }
+            break;
+            
+        case ESP_BT_GAP_PIN_REQ_EVT:
+            // Для устройств, требующих PIN-код
+            ESP_LOGI(TAG, "Требуется PIN-код");
+            esp_bt_pin_code_t pin_code = {0};
+            esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin_code);
+            break;
+            
+        case ESP_BT_GAP_CFM_REQ_EVT:
+            // Подтверждение числового сравнения
+            esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+            break;
+            
+        default:
+            break;
     }
 }
 
 /* Инициализация UART */
 static void uart_init(void)
 {
-    // Базовая инициализация UART через драйвер (совместима с ESP-IDF 3.1.0)
     uart_config_t uart_config = {
         .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
@@ -152,19 +156,19 @@ static void uart_init(void)
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .rx_flow_ctrl_thresh = 122,
-        .use_ref_tick = false
+        .source_clk = UART_SCLK_DEFAULT,
     };
     
     // Настройка параметров UART
     uart_param_config(UART_NUM, &uart_config);
     
-    // Установка пинов UART (UART0 по умолчанию использует GPIO1-TX, GPIO3-RX)
+    // Установка пинов UART
     uart_set_pin(UART_NUM, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     
-    // Установка драйвера UART с буферами
+    // Установка драйвера UART
     uart_driver_install(UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0);
     
-    ESP_LOGI(TAG, "UART инициализирован");
+    ESP_LOGI(TAG, "UART инициализирован на скорости 115200");
 }
 
 /* Задача для чтения данных мыши и отправки через HID */
@@ -173,24 +177,29 @@ static void hid_mouse_task(void *pvParameters)
     uint8_t data[RD_BYTES];
     uint8_t mouse_report[4] = {0}; // [buttons, dx, dy, wheel]
     
+    ESP_LOGI(TAG, "Задача HID-мыши запущена");
+    
     while (1) {
-        if (connected) {
+        if (connected && hid_dev != NULL) {
             // Чтение данных из UART
             int len = uart_read_bytes(UART_NUM, data, RD_BYTES, 20 / portTICK_PERIOD_MS);
             
             if (len == RD_BYTES) {
-                // Формируем отчет мыши: [кнопки, перемещение X, перемещение Y, колесо]
-                mouse_report[0] = 0;  // Кнопки не нажаты
-                mouse_report[1] = data[0]; // dx (относительное перемещение по X)
-                mouse_report[2] = data[1]; // dy (относительное перемещение по Y)
-                mouse_report[3] = 0;  // Колесо
+                // Формируем отчет мыши
+                mouse_report[0] = 0x00;  // Кнопки не нажаты
+                mouse_report[1] = data[0]; // dx
+                mouse_report[2] = data[1]; // dy  
+                mouse_report[3] = 0x00;  // Колесо
                 
                 // Отправка отчета мыши
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 
-                                            ESP_HIDD_REPORT_ID_MOUSE, 
-                                            4, mouse_report);
+                esp_hidd_dev_report_send(hid_dev, ESP_HIDD_REPORT_TYPE_INTRDATA, 
+                                        ESP_HIDD_REPORT_ID_MOUSE, 
+                                        4, mouse_report);
                 
-                ESP_LOGI(TAG, "Отправлено перемещение: dx=%d, dy=%d", data[0], data[1]);
+                ESP_LOGI(TAG, "Отправлено перемещение: dx=%d, dy=%d", 
+                         (int8_t)data[0], (int8_t)data[1]);
+            } else if (len > 0) {
+                ESP_LOGW(TAG, "Прочитано неверное количество байт: %d", len);
             }
         } else {
             // Если не подключено, ждем перед следующей проверкой
@@ -202,11 +211,11 @@ static void hid_mouse_task(void *pvParameters)
 /* Главная функция приложения */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Запуск HID-мыши...");
+    ESP_LOGI(TAG, "Запуск HID-мыши на ESP-IDF v5.3.1...");
     
     // Инициализация NVS
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
@@ -214,6 +223,7 @@ void app_main(void)
     
     // Инициализация Bluetooth контроллера
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
+    
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
@@ -224,13 +234,36 @@ void app_main(void)
     
     // Регистрация обработчиков
     ESP_ERROR_CHECK(esp_bt_gap_register_callback(gap_event_handler));
-    ESP_ERROR_CHECK(esp_bt_hid_device_register_callback(hidd_event_callback));
     
     // Установка имени устройства
     ESP_ERROR_CHECK(esp_bt_dev_set_device_name(HID_DEVICE_NAME));
     
     // Инициализация HID-устройства
-    ESP_ERROR_CHECK(esp_bt_hid_device_init());
+    esp_hidd_dev_config_t hid_config = {
+        .device_type = ESP_HIDD_CLASSIC_BT,
+        .mode = ESP_HIDD_MODE_REPORT,
+        .name = HID_DEVICE_NAME,
+        .description = "ESP32 HID Mouse",
+        .provider = "ESP32",
+        .subclass = ESP_HID_CLASS_MIC,
+        .report_map_size = sizeof(hid_mouse_report_map),
+        .report_map_data = hid_mouse_report_map,
+    };
+    
+    hid_dev = esp_hidd_dev_init(&hid_config);
+    if (hid_dev == NULL) {
+        ESP_LOGE(TAG, "Ошибка инициализации HID-устройства");
+        return;
+    }
+    
+    // Регистрация callback для HID событий
+    ESP_ERROR_CHECK(esp_hidd_dev_register_callback(hid_dev, hidd_event_callback, NULL));
+    
+    // Запуск HID-устройства
+    ESP_ERROR_CHECK(esp_hidd_dev_start(hid_dev));
+    
+    // Установка режима обнаружения
+    esp_bt_gap_set_scan_mode(ESP_BT_SCAN_MODE_CONNECTABLE_DISCOVERABLE);
     
     // Инициализация UART
     uart_init();
@@ -239,4 +272,5 @@ void app_main(void)
     xTaskCreate(hid_mouse_task, "hid_mouse_task", 4096, NULL, 5, NULL);
     
     ESP_LOGI(TAG, "Инициализация завершена. Ожидание подключения...");
+    ESP_LOGI(TAG, "Имя устройства: %s", HID_DEVICE_NAME);
 }
